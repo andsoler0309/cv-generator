@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import puppeteer from 'puppeteer-core';
-import chromium from '@sparticuz/chromium';
+import chromium from '@sparticuz/chromium-min';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60; // Allow up to 60 seconds for PDF generation
+
+// Remote chromium URL for serverless environments
+const CHROMIUM_URL = 'https://github.com/nickytonline/chromium/releases/download/v128.0.0/chromium-v128.0.0-pack.tar';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -116,7 +119,7 @@ Return ONLY the complete HTML document. No explanations, no markdown.`;
 
 async function convertHTMLtoPDF(html: string): Promise<Buffer> {
   // Check if running locally or in production (Vercel)
-  const isLocal = process.env.NODE_ENV === 'development' || !process.env.VERCEL;
+  const isLocal = process.env.NODE_ENV === 'development' && !process.env.VERCEL;
   
   let browser;
   
@@ -129,8 +132,8 @@ async function convertHTMLtoPDF(html: string): Promise<Buffer> {
         args: ['--no-sandbox', '--disable-setuid-sandbox'],
       });
     } catch {
-      // Fallback to puppeteer-core with chromium
-      const executablePath = await chromium.executablePath();
+      // Fallback to chromium-min
+      const executablePath = await chromium.executablePath(CHROMIUM_URL);
       browser = await puppeteer.launch({
         args: chromium.args,
         defaultViewport: { width: 1920, height: 1080 },
@@ -139,8 +142,8 @@ async function convertHTMLtoPDF(html: string): Promise<Buffer> {
       });
     }
   } else {
-    // Production (Vercel) - use @sparticuz/chromium
-    const executablePath = await chromium.executablePath();
+    // Production (Vercel) - use @sparticuz/chromium-min with remote binary
+    const executablePath = await chromium.executablePath(CHROMIUM_URL);
     browser = await puppeteer.launch({
       args: chromium.args,
       defaultViewport: { width: 1920, height: 1080 },
