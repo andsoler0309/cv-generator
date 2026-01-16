@@ -1,17 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
-import PDFDocument from 'pdfkit';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import OpenAI from 'openai';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // Colors
 const COLORS = {
-  primary: '#2563eb',      // Blue for name and headers
-  text: '#1f2937',         // Dark gray for body text
-  secondary: '#6b7280',    // Medium gray for dates/secondary text
-  light: '#9ca3af',        // Light gray for subtle elements
-  link: '#2563eb',         // Blue for links
+  primary: rgb(0.145, 0.388, 0.922),    // #2563eb - Blue
+  text: rgb(0.122, 0.161, 0.216),        // #1f2937 - Dark gray
+  secondary: rgb(0.420, 0.451, 0.498),   // #6b7280 - Medium gray
+  line: rgb(0.898, 0.902, 0.918),        // #e5e7eb - Light gray
 };
+
+interface CVSection {
+  type: 'name' | 'contact' | 'section_header' | 'job_title' | 'job_details' | 'bullet' | 'text' | 'skill_group';
+  content: string;
+  secondary?: string; // For dates, locations, etc.
+}
+
+interface StructuredCV {
+  sections: CVSection[];
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -24,9 +39,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    console.log('📄 Generating PDF with pdfkit...');
+    console.log('🤖 Using AI to structure CV for PDF...');
     
-    const pdfBuffer = await generatePDF(optimizedText);
+    // Step 1: Use AI to parse and structure the CV
+    const structuredCV = await parseWithAI(optimizedText);
+    
+    console.log('📄 Generating PDF with pdf-lib...');
+    
+    // Step 2: Render the structured CV to PDF
+    const pdfBytes = await generatePDF(structuredCV);
 
     const baseFileName = originalFileName
       ? originalFileName.replace(/\.[^/.]+$/, '')
@@ -35,7 +56,7 @@ export async function POST(request: NextRequest) {
 
     console.log('✅ PDF generated successfully');
 
-    return new NextResponse(new Uint8Array(pdfBuffer), {
+    return new NextResponse(new Uint8Array(pdfBytes), {
       headers: {
         'Content-Type': 'application/pdf',
         'Content-Disposition': `attachment; filename="${fileName}"`,
@@ -50,207 +71,295 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function generatePDF(cvText: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({
-        size: 'A4',
-        margins: { top: 50, bottom: 50, left: 50, right: 50 },
-        bufferPages: true,
-      });
+async function parseWithAI(cvText: string): Promise<StructuredCV> {
+  const prompt = `Parse this CV text into a structured JSON format for PDF generation. 
 
-      const chunks: Buffer[] = [];
-      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
+RULES:
+1. Identify the person's name (usually first line)
+2. Identify contact info (email, phone, LinkedIn, location)
+3. Identify section headers (EXPERIENCE, EDUCATION, SKILLS, etc.)
+4. For jobs: extract title, company, dates separately
+5. Identify bullet points (achievements/responsibilities)
+6. Group skills appropriately
 
-      // Parse and render the CV
-      renderCV(doc, cvText);
-
-      doc.end();
-    } catch (error) {
-      reject(error);
-    }
-  });
+Return JSON in this EXACT format:
+{
+  "sections": [
+    {"type": "name", "content": "John Doe"},
+    {"type": "contact", "content": "john@email.com | +1234567890 | LinkedIn: /in/johndoe | New York, NY"},
+    {"type": "section_header", "content": "PROFESSIONAL EXPERIENCE"},
+    {"type": "job_title", "content": "Senior Software Engineer", "secondary": "2022 - Present"},
+    {"type": "job_details", "content": "Google", "secondary": "Mountain View, CA"},
+    {"type": "bullet", "content": "Led development of microservices architecture serving 1M+ users"},
+    {"type": "bullet", "content": "Reduced system latency by 40% through optimization"},
+    {"type": "section_header", "content": "EDUCATION"},
+    {"type": "text", "content": "Master of Computer Science, Stanford University, 2020"},
+    {"type": "section_header", "content": "SKILLS"},
+    {"type": "skill_group", "content": "Python, Java, TypeScript, Go, SQL, AWS, Docker, Kubernetes"}
+  ]
 }
 
-function renderCV(doc: PDFKit.PDFDocument, cvText: string) {
-  const lines = cvText.split('\n');
-  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-  
-  let isFirstLine = true;
-  let isContactLine = false;
-  let currentSection = '';
-  
-  // Section patterns
-  const sectionPattern = /^(SUMMARY|EXPERIENCE|EDUCATION|SKILLS|PROJECTS|CERTIFICATIONS?|LANGUAGES?|PROFESSIONAL EXPERIENCE|WORK HISTORY|TECHNICAL SKILLS|PROFILE|ABOUT)$/i;
-  const datePattern = /\b(19|20)\d{2}\b.*?(present|current|19|20)\d{0,2}/i;
-  const contactPattern = /@|linkedin|github|\+\d{10,}|\.com/i;
-  const bulletPattern = /^[\s]*[-•*▸►]\s*/;
+CV TEXT:
+${cvText}
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+Return ONLY valid JSON, no explanation.`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You parse CVs into structured JSON. Output only valid JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+    });
+
+    const result = JSON.parse(response.choices[0]?.message?.content || '{}');
     
-    if (!line) {
-      doc.moveDown(0.3);
-      continue;
+    if (!result.sections || !Array.isArray(result.sections)) {
+      // Fallback to basic parsing
+      return fallbackParse(cvText);
     }
-
-    // Check if we need a new page
-    if (doc.y > doc.page.height - 80) {
-      doc.addPage();
-    }
-
-    // First non-empty line is the name
-    if (isFirstLine && line.length < 50) {
-      doc.fontSize(22)
-         .fillColor(COLORS.primary)
-         .font('Helvetica-Bold')
-         .text(line, { align: 'left' });
-      doc.moveDown(0.2);
-      isFirstLine = false;
-      isContactLine = true;
-      continue;
-    }
-
-    // Contact info line (usually second line with email, phone, etc.)
-    if (isContactLine && (contactPattern.test(line) || i <= 3)) {
-      doc.fontSize(9)
-         .fillColor(COLORS.secondary)
-         .font('Helvetica')
-         .text(sanitizeText(line), { align: 'left' });
-      
-      if (!contactPattern.test(lines[i + 1] || '')) {
-        isContactLine = false;
-        doc.moveDown(0.8);
-      } else {
-        doc.moveDown(0.1);
-      }
-      continue;
-    }
-    isContactLine = false;
-    isFirstLine = false;
-
-    // Section headers
-    if (sectionPattern.test(line)) {
-      currentSection = line.toUpperCase();
-      doc.moveDown(0.5);
-      doc.fontSize(11)
-         .fillColor(COLORS.primary)
-         .font('Helvetica-Bold')
-         .text(line.toUpperCase());
-      
-      // Draw line under header
-      doc.moveTo(doc.x, doc.y + 2)
-         .lineTo(doc.x + pageWidth, doc.y + 2)
-         .strokeColor('#e5e7eb')
-         .lineWidth(0.5)
-         .stroke();
-      
-      doc.moveDown(0.4);
-      continue;
-    }
-
-    // Job title / Company lines (contain dates)
-    if (datePattern.test(line)) {
-      doc.fontSize(10)
-         .fillColor(COLORS.text)
-         .font('Helvetica-Bold')
-         .text(sanitizeText(line), { align: 'left' });
-      doc.moveDown(0.2);
-      continue;
-    }
-
-    // Company/Role lines without dates but look like headers (short, no bullet)
-    if (!bulletPattern.test(line) && line.length < 80 && !line.includes('.') && 
-        (currentSection === 'EXPERIENCE' || currentSection === 'PROFESSIONAL EXPERIENCE' || currentSection === 'WORK HISTORY')) {
-      // Check if next line has a date - if so, this is likely a company name
-      const nextLine = lines[i + 1] || '';
-      if (datePattern.test(nextLine) || line.includes(' - ') || line.includes(' | ')) {
-        doc.fontSize(10)
-           .fillColor(COLORS.text)
-           .font('Helvetica-Bold')
-           .text(sanitizeText(line));
-        doc.moveDown(0.1);
-        continue;
-      }
-    }
-
-    // Bullet points
-    if (bulletPattern.test(line)) {
-      const bulletText = line.replace(bulletPattern, '').trim();
-      const bulletX = doc.x;
-      
-      doc.fontSize(9)
-         .fillColor(COLORS.text)
-         .font('Helvetica')
-         .text('•', bulletX, doc.y, { continued: false });
-      
-      doc.fontSize(9)
-         .text(sanitizeText(bulletText), bulletX + 12, doc.y - 11, {
-           width: pageWidth - 12,
-           align: 'left',
-         });
-      doc.moveDown(0.1);
-      continue;
-    }
-
-    // Skills section - often comma-separated or special formatting
-    if (currentSection === 'SKILLS' || currentSection === 'TECHNICAL SKILLS') {
-      doc.fontSize(9)
-         .fillColor(COLORS.text)
-         .font('Helvetica')
-         .text(sanitizeText(line), { align: 'left' });
-      doc.moveDown(0.2);
-      continue;
-    }
-
-    // Education entries
-    if (currentSection === 'EDUCATION') {
-      if (line.includes('University') || line.includes('College') || line.includes('Degree') || line.includes('Master') || line.includes('Bachelor')) {
-        doc.fontSize(10)
-           .fillColor(COLORS.text)
-           .font('Helvetica-Bold')
-           .text(sanitizeText(line));
-      } else {
-        doc.fontSize(9)
-           .fillColor(COLORS.secondary)
-           .font('Helvetica')
-           .text(sanitizeText(line));
-      }
-      doc.moveDown(0.2);
-      continue;
-    }
-
-    // Regular text
-    doc.fontSize(9)
-       .fillColor(COLORS.text)
-       .font('Helvetica')
-       .text(sanitizeText(line), {
-         width: pageWidth,
-         align: 'left',
-       });
-    doc.moveDown(0.2);
+    
+    return result;
+  } catch (error) {
+    console.error('AI parsing failed, using fallback:', error);
+    return fallbackParse(cvText);
   }
 }
 
-// Sanitize text to remove characters that pdfkit can't handle
+function fallbackParse(cvText: string): StructuredCV {
+  const lines = cvText.split('\n').filter(l => l.trim());
+  const sections: CVSection[] = [];
+  
+  const sectionPattern = /^(SUMMARY|EXPERIENCE|EDUCATION|SKILLS|PROJECTS|CERTIFICATIONS?|LANGUAGES?|PROFESSIONAL EXPERIENCE|WORK HISTORY|TECHNICAL SKILLS|PROFILE|ABOUT)$/i;
+  const bulletPattern = /^[\s]*[-•*]\s*/;
+  
+  let isFirst = true;
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    
+    if (isFirst) {
+      sections.push({ type: 'name', content: trimmed });
+      isFirst = false;
+      continue;
+    }
+    
+    if (sections.length === 1 && (trimmed.includes('@') || trimmed.includes('linkedin'))) {
+      sections.push({ type: 'contact', content: trimmed });
+      continue;
+    }
+    
+    if (sectionPattern.test(trimmed)) {
+      sections.push({ type: 'section_header', content: trimmed.toUpperCase() });
+      continue;
+    }
+    
+    if (bulletPattern.test(trimmed)) {
+      sections.push({ type: 'bullet', content: trimmed.replace(bulletPattern, '') });
+      continue;
+    }
+    
+    sections.push({ type: 'text', content: trimmed });
+  }
+  
+  return { sections };
+}
+
+async function generatePDF(cv: StructuredCV): Promise<Uint8Array> {
+  const pdfDoc = await PDFDocument.create();
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  
+  const pageWidth = 612; // Letter size
+  const pageHeight = 792;
+  const margin = 50;
+  const contentWidth = pageWidth - margin * 2;
+  
+  let page = pdfDoc.addPage([pageWidth, pageHeight]);
+  let y = pageHeight - margin;
+  
+  const addNewPageIfNeeded = (requiredSpace: number) => {
+    if (y - requiredSpace < margin) {
+      page = pdfDoc.addPage([pageWidth, pageHeight]);
+      y = pageHeight - margin;
+    }
+  };
+  
+  const drawText = (
+    text: string, 
+    x: number, 
+    fontSize: number, 
+    font: typeof helvetica, 
+    color: typeof COLORS.text,
+    maxWidth?: number
+  ) => {
+    const cleanText = sanitizeText(text);
+    const words = cleanText.split(' ');
+    const lines: string[] = [];
+    let currentLine = '';
+    
+    const effectiveWidth = maxWidth || contentWidth;
+    
+    for (const word of words) {
+      const testLine = currentLine ? `${currentLine} ${word}` : word;
+      const testWidth = font.widthOfTextAtSize(testLine, fontSize);
+      
+      if (testWidth > effectiveWidth && currentLine) {
+        lines.push(currentLine);
+        currentLine = word;
+      } else {
+        currentLine = testLine;
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+    
+    for (const line of lines) {
+      addNewPageIfNeeded(fontSize + 4);
+      page.drawText(line, { x, y, size: fontSize, font, color });
+      y -= fontSize + 4;
+    }
+    
+    return lines.length * (fontSize + 4);
+  };
+  
+  for (const section of cv.sections) {
+    switch (section.type) {
+      case 'name':
+        addNewPageIfNeeded(30);
+        page.drawText(sanitizeText(section.content), {
+          x: margin,
+          y,
+          size: 24,
+          font: helveticaBold,
+          color: COLORS.primary,
+        });
+        y -= 32;
+        break;
+        
+      case 'contact':
+        addNewPageIfNeeded(16);
+        page.drawText(sanitizeText(section.content), {
+          x: margin,
+          y,
+          size: 10,
+          font: helvetica,
+          color: COLORS.secondary,
+        });
+        y -= 24;
+        break;
+        
+      case 'section_header':
+        y -= 12; // Extra space before section
+        addNewPageIfNeeded(30);
+        page.drawText(sanitizeText(section.content), {
+          x: margin,
+          y,
+          size: 12,
+          font: helveticaBold,
+          color: COLORS.primary,
+        });
+        y -= 4;
+        // Draw line under header
+        page.drawLine({
+          start: { x: margin, y },
+          end: { x: margin + contentWidth, y },
+          thickness: 0.5,
+          color: COLORS.line,
+        });
+        y -= 12;
+        break;
+        
+      case 'job_title':
+        addNewPageIfNeeded(20);
+        const titleText = sanitizeText(section.content);
+        page.drawText(titleText, {
+          x: margin,
+          y,
+          size: 11,
+          font: helveticaBold,
+          color: COLORS.text,
+        });
+        if (section.secondary) {
+          const dateText = sanitizeText(section.secondary);
+          const dateWidth = helvetica.widthOfTextAtSize(dateText, 10);
+          page.drawText(dateText, {
+            x: pageWidth - margin - dateWidth,
+            y,
+            size: 10,
+            font: helvetica,
+            color: COLORS.secondary,
+          });
+        }
+        y -= 16;
+        break;
+        
+      case 'job_details':
+        addNewPageIfNeeded(16);
+        const companyText = sanitizeText(section.content);
+        page.drawText(companyText, {
+          x: margin,
+          y,
+          size: 10,
+          font: helvetica,
+          color: COLORS.secondary,
+        });
+        if (section.secondary) {
+          const locText = sanitizeText(section.secondary);
+          const locWidth = helvetica.widthOfTextAtSize(locText, 10);
+          page.drawText(locText, {
+            x: pageWidth - margin - locWidth,
+            y,
+            size: 10,
+            font: helvetica,
+            color: COLORS.secondary,
+          });
+        }
+        y -= 14;
+        break;
+        
+      case 'bullet':
+        addNewPageIfNeeded(16);
+        page.drawText('•', {
+          x: margin + 4,
+          y,
+          size: 10,
+          font: helvetica,
+          color: COLORS.text,
+        });
+        drawText(section.content, margin + 16, 10, helvetica, COLORS.text, contentWidth - 16);
+        break;
+        
+      case 'skill_group':
+        addNewPageIfNeeded(16);
+        drawText(section.content, margin, 10, helvetica, COLORS.text);
+        y -= 4;
+        break;
+        
+      case 'text':
+      default:
+        addNewPageIfNeeded(16);
+        drawText(section.content, margin, 10, helvetica, COLORS.text);
+        break;
+    }
+  }
+  
+  return await pdfDoc.save();
+}
+
 function sanitizeText(text: string): string {
   return text
-    // Replace special quotes
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
-    // Replace special bullets (keep standard bullet)
-    .replace(/[▸►◆◇■□●○]/g, '•')
-    // Replace special dashes
+    .replace(/[▸►◆◇■□●○•]/g, '-')
     .replace(/[\u2013\u2014]/g, '-')
-    // Replace other problematic characters
-    .replace(/[\u00A0]/g, ' ')  // Non-breaking space
-    .replace(/[\u2026]/g, '...') // Ellipsis
-    .replace(/[\u00B7]/g, '•')   // Middle dot
-    // Remove or replace checkmarks and other symbols
+    .replace(/[\u00A0]/g, ' ')
+    .replace(/[\u2026]/g, '...')
+    .replace(/[\u00B7]/g, '-')
     .replace(/[✓✔☑]/g, '[x]')
     .replace(/[✗✘☐]/g, '[ ]')
-    // Keep only ASCII and common extended chars
-    .replace(/[^\x20-\x7E\xA0-\xFF•]/g, '');
+    .replace(/[^\x20-\x7E]/g, '');
 }
