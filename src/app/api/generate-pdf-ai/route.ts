@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -114,15 +115,39 @@ Return ONLY the complete HTML document. No explanations, no markdown.`;
 }
 
 async function convertHTMLtoPDF(html: string): Promise<Buffer> {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-    ],
-  });
+  // Check if running locally or in production (Vercel)
+  const isLocal = process.env.NODE_ENV === 'development' || !process.env.VERCEL;
+  
+  let browser;
+  
+  if (isLocal) {
+    // Local development - use regular puppeteer if available
+    try {
+      const puppeteerFull = await import('puppeteer');
+      browser = await puppeteerFull.default.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      });
+    } catch {
+      // Fallback to puppeteer-core with chromium
+      const executablePath = await chromium.executablePath();
+      browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: { width: 1920, height: 1080 },
+        executablePath: executablePath,
+        headless: true,
+      });
+    }
+  } else {
+    // Production (Vercel) - use @sparticuz/chromium
+    const executablePath = await chromium.executablePath();
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: { width: 1920, height: 1080 },
+      executablePath: executablePath,
+      headless: true,
+    });
+  }
 
   try {
     const page = await browser.newPage();
