@@ -1,18 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import OpenAI from 'openai';
-import puppeteer from 'puppeteer-core';
-import chromium from '@sparticuz/chromium-min';
+import PDFDocument from 'pdfkit';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60; // Allow up to 60 seconds for PDF generation
 
-// Remote chromium URL for serverless environments
-const CHROMIUM_URL = 'https://github.com/nickytonline/chromium/releases/download/v128.0.0/chromium-v128.0.0-pack.tar';
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// Colors
+const COLORS = {
+  primary: '#2563eb',      // Blue for name and headers
+  text: '#1f2937',         // Dark gray for body text
+  secondary: '#6b7280',    // Medium gray for dates/secondary text
+  light: '#9ca3af',        // Light gray for subtle elements
+  link: '#2563eb',         // Blue for links
+};
 
 export async function POST(request: NextRequest) {
   try {
@@ -24,18 +23,17 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-    
-    // Step 1: Generate beautiful HTML/CSS with AI
-    const htmlContent = await generateStyledHTML(optimizedText);
-    
-    // Step 2: Convert HTML to PDF using Puppeteer
-    const pdfBuffer = await convertHTMLtoPDF(htmlContent);
 
-    // Generate filename
+    console.log('📄 Generating PDF with pdfkit...');
+    
+    const pdfBuffer = await generatePDF(optimizedText);
+
     const baseFileName = originalFileName
       ? originalFileName.replace(/\.[^/.]+$/, '')
       : 'cv';
     const fileName = `${baseFileName}_optimized.pdf`;
+
+    console.log('✅ PDF generated successfully');
 
     return new NextResponse(new Uint8Array(pdfBuffer), {
       headers: {
@@ -52,128 +50,207 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function generateStyledHTML(cvText: string): Promise<string> {
-  console.log('Generating styled HTML for CV...');
-  
-  const prompt = `You are an expert CV/resume designer specializing in ATS-optimized resumes. Convert the following OPTIMIZED CV text into a professional, ATS-friendly HTML resume.
+async function generatePDF(cvText: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({
+        size: 'A4',
+        margins: { top: 50, bottom: 50, left: 50, right: 50 },
+        bufferPages: true,
+      });
 
-CRITICAL REQUIREMENTS:
-1. **LENGTH**: Maximum 1-2 pages. Be concise. Remove redundancy.
-2. **ATS-FRIENDLY**: 
-   - Use simple, clean HTML structure
-   - NO tables for layout (use divs with flexbox/grid sparingly)
-   - NO images, icons, or graphics
-   - Standard section headings: SUMMARY, EXPERIENCE, EDUCATION, SKILLS
-   - Simple bullet points (use • character)
-3. **STYLING**:
-   - Clean, professional look with subtle colors
-   - Primary color: #2563eb (blue) for name and section headers only
-   - All other text: #1f2937 (dark gray)
-   - Font: Arial, sans-serif (ATS-safe)
-   - Font sizes: Name 24px, Section headers 14px bold, Body 11px
-   - Margins: 0.5 inch all around
-   - Line height: 1.4 for readability
-4. **STRUCTURE**:
-   - Name at top (larger, blue)
-   - Contact info on one line below name (email | phone | location | linkedin)
-   - Clear section breaks with blue header and thin line
-   - Job entries: Company + Title on one line, dates on right
-   - Bullet points for achievements (3-5 per role max)
-   - Skills as comma-separated list or simple columns
-5. **CONTENT**: Use EXACTLY the text provided. Do not add or remove content.
+      const chunks: Buffer[] = [];
+      doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
 
-CV TEXT TO FORMAT:
-${cvText}
+      // Parse and render the CV
+      renderCV(doc, cvText);
 
-Return ONLY the complete HTML document. No explanations, no markdown.`;
-
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      {
-        role: 'system',
-        content: 'You are an ATS resume expert. Create clean, scannable HTML resumes that pass ATS systems and impress recruiters. Output only valid HTML.',
-      },
-      {
-        role: 'user',
-        content: prompt,
-      },
-    ],
-    max_tokens: 4000,
-    temperature: 0.2,
+      doc.end();
+    } catch (error) {
+      reject(error);
+    }
   });
-
-  let html = response.choices[0]?.message?.content || '';
-  
-  // Clean up any markdown code blocks if present
-  html = html.replace(/```html\n?/gi, '').replace(/```\n?/gi, '').trim();
-  
-  // Ensure it starts with DOCTYPE
-  if (!html.toLowerCase().startsWith('<!doctype')) {
-    html = '<!DOCTYPE html>\n' + html;
-  }
-
-  return html;
 }
 
-async function convertHTMLtoPDF(html: string): Promise<Buffer> {
-  // Check if running locally or in production (Vercel)
-  const isLocal = process.env.NODE_ENV === 'development' && !process.env.VERCEL;
+function renderCV(doc: PDFKit.PDFDocument, cvText: string) {
+  const lines = cvText.split('\n');
+  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   
-  let browser;
+  let isFirstLine = true;
+  let isContactLine = false;
+  let currentSection = '';
   
-  if (isLocal) {
-    // Local development - use regular puppeteer if available
-    try {
-      const puppeteerFull = await import('puppeteer');
-      browser = await puppeteerFull.default.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      });
-    } catch {
-      // Fallback to chromium-min
-      const executablePath = await chromium.executablePath(CHROMIUM_URL);
-      browser = await puppeteer.launch({
-        args: chromium.args,
-        defaultViewport: { width: 1920, height: 1080 },
-        executablePath: executablePath,
-        headless: true,
-      });
-    }
-  } else {
-    // Production (Vercel) - use @sparticuz/chromium-min with remote binary
-    const executablePath = await chromium.executablePath(CHROMIUM_URL);
-    browser = await puppeteer.launch({
-      args: chromium.args,
-      defaultViewport: { width: 1920, height: 1080 },
-      executablePath: executablePath,
-      headless: true,
-    });
-  }
+  // Section patterns
+  const sectionPattern = /^(SUMMARY|EXPERIENCE|EDUCATION|SKILLS|PROJECTS|CERTIFICATIONS?|LANGUAGES?|PROFESSIONAL EXPERIENCE|WORK HISTORY|TECHNICAL SKILLS|PROFILE|ABOUT)$/i;
+  const datePattern = /\b(19|20)\d{2}\b.*?(present|current|19|20)\d{0,2}/i;
+  const contactPattern = /@|linkedin|github|\+\d{10,}|\.com/i;
+  const bulletPattern = /^[\s]*[-•*▸►]\s*/;
 
-  try {
-    const page = await browser.newPage();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
     
-    // Set content and wait for any styles to load
-    await page.setContent(html, {
-      waitUntil: 'networkidle0',
-    });
+    if (!line) {
+      doc.moveDown(0.3);
+      continue;
+    }
 
-    // Generate PDF
-    const pdfBuffer = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      margin: {
-        top: '0.5in',
-        right: '0.5in',
-        bottom: '0.5in',
-        left: '0.5in',
-      },
-    });
+    // Check if we need a new page
+    if (doc.y > doc.page.height - 80) {
+      doc.addPage();
+    }
 
-    return Buffer.from(pdfBuffer);
-  } finally {
-    await browser.close();
+    // First non-empty line is the name
+    if (isFirstLine && line.length < 50) {
+      doc.fontSize(22)
+         .fillColor(COLORS.primary)
+         .font('Helvetica-Bold')
+         .text(line, { align: 'left' });
+      doc.moveDown(0.2);
+      isFirstLine = false;
+      isContactLine = true;
+      continue;
+    }
+
+    // Contact info line (usually second line with email, phone, etc.)
+    if (isContactLine && (contactPattern.test(line) || i <= 3)) {
+      doc.fontSize(9)
+         .fillColor(COLORS.secondary)
+         .font('Helvetica')
+         .text(sanitizeText(line), { align: 'left' });
+      
+      if (!contactPattern.test(lines[i + 1] || '')) {
+        isContactLine = false;
+        doc.moveDown(0.8);
+      } else {
+        doc.moveDown(0.1);
+      }
+      continue;
+    }
+    isContactLine = false;
+    isFirstLine = false;
+
+    // Section headers
+    if (sectionPattern.test(line)) {
+      currentSection = line.toUpperCase();
+      doc.moveDown(0.5);
+      doc.fontSize(11)
+         .fillColor(COLORS.primary)
+         .font('Helvetica-Bold')
+         .text(line.toUpperCase());
+      
+      // Draw line under header
+      doc.moveTo(doc.x, doc.y + 2)
+         .lineTo(doc.x + pageWidth, doc.y + 2)
+         .strokeColor('#e5e7eb')
+         .lineWidth(0.5)
+         .stroke();
+      
+      doc.moveDown(0.4);
+      continue;
+    }
+
+    // Job title / Company lines (contain dates)
+    if (datePattern.test(line)) {
+      doc.fontSize(10)
+         .fillColor(COLORS.text)
+         .font('Helvetica-Bold')
+         .text(sanitizeText(line), { align: 'left' });
+      doc.moveDown(0.2);
+      continue;
+    }
+
+    // Company/Role lines without dates but look like headers (short, no bullet)
+    if (!bulletPattern.test(line) && line.length < 80 && !line.includes('.') && 
+        (currentSection === 'EXPERIENCE' || currentSection === 'PROFESSIONAL EXPERIENCE' || currentSection === 'WORK HISTORY')) {
+      // Check if next line has a date - if so, this is likely a company name
+      const nextLine = lines[i + 1] || '';
+      if (datePattern.test(nextLine) || line.includes(' - ') || line.includes(' | ')) {
+        doc.fontSize(10)
+           .fillColor(COLORS.text)
+           .font('Helvetica-Bold')
+           .text(sanitizeText(line));
+        doc.moveDown(0.1);
+        continue;
+      }
+    }
+
+    // Bullet points
+    if (bulletPattern.test(line)) {
+      const bulletText = line.replace(bulletPattern, '').trim();
+      const bulletX = doc.x;
+      
+      doc.fontSize(9)
+         .fillColor(COLORS.text)
+         .font('Helvetica')
+         .text('•', bulletX, doc.y, { continued: false });
+      
+      doc.fontSize(9)
+         .text(sanitizeText(bulletText), bulletX + 12, doc.y - 11, {
+           width: pageWidth - 12,
+           align: 'left',
+         });
+      doc.moveDown(0.1);
+      continue;
+    }
+
+    // Skills section - often comma-separated or special formatting
+    if (currentSection === 'SKILLS' || currentSection === 'TECHNICAL SKILLS') {
+      doc.fontSize(9)
+         .fillColor(COLORS.text)
+         .font('Helvetica')
+         .text(sanitizeText(line), { align: 'left' });
+      doc.moveDown(0.2);
+      continue;
+    }
+
+    // Education entries
+    if (currentSection === 'EDUCATION') {
+      if (line.includes('University') || line.includes('College') || line.includes('Degree') || line.includes('Master') || line.includes('Bachelor')) {
+        doc.fontSize(10)
+           .fillColor(COLORS.text)
+           .font('Helvetica-Bold')
+           .text(sanitizeText(line));
+      } else {
+        doc.fontSize(9)
+           .fillColor(COLORS.secondary)
+           .font('Helvetica')
+           .text(sanitizeText(line));
+      }
+      doc.moveDown(0.2);
+      continue;
+    }
+
+    // Regular text
+    doc.fontSize(9)
+       .fillColor(COLORS.text)
+       .font('Helvetica')
+       .text(sanitizeText(line), {
+         width: pageWidth,
+         align: 'left',
+       });
+    doc.moveDown(0.2);
   }
+}
+
+// Sanitize text to remove characters that pdfkit can't handle
+function sanitizeText(text: string): string {
+  return text
+    // Replace special quotes
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    // Replace special bullets (keep standard bullet)
+    .replace(/[▸►◆◇■□●○]/g, '•')
+    // Replace special dashes
+    .replace(/[\u2013\u2014]/g, '-')
+    // Replace other problematic characters
+    .replace(/[\u00A0]/g, ' ')  // Non-breaking space
+    .replace(/[\u2026]/g, '...') // Ellipsis
+    .replace(/[\u00B7]/g, '•')   // Middle dot
+    // Remove or replace checkmarks and other symbols
+    .replace(/[✓✔☑]/g, '[x]')
+    .replace(/[✗✘☐]/g, '[ ]')
+    // Keep only ASCII and common extended chars
+    .replace(/[^\x20-\x7E\xA0-\xFF•]/g, '');
 }
